@@ -1,157 +1,47 @@
-# Description
-#   A Hubot script that relay the backlog activities to your chat room.
-#
-# Dependencies:
-#   "request": "^2.40.0"
-#
-# Configuration:
-#   HUBOT_BACKLOG_ACTIVITY_SPACE_ID
-#   HUBOT_BACKLOG_ACTIVITY_API_KEY
-#   HUBOT_BACKLOG_ACTIVITY_MAPPINGS
-#   HUBOT_BACKLOG_ACTIVITY_USER_MAPPINGS
-#   HUBOT_BACKLOG_ACTIVITY_INTERVAL
-#   HUBOT_BACKLOG_ACTIVITY_USE_SLACK
-#
-# Author:
-#   bouzuya <m@bouzuya.net>
-#
-request = require 'request'
+backlogUrl = 'https://XXXXX.backlog.jp/'
 
 module.exports = (robot) ->
-  SPACE_ID = process.env.HUBOT_BACKLOG_ACTIVITY_SPACE_ID
-  API_KEY = process.env.HUBOT_BACKLOG_ACTIVITY_API_KEY
-  MAPPINGS = process.env.HUBOT_BACKLOG_ACTIVITY_MAPPINGS ? '{}'
-  USER_MAPPINGS = process.env.HUBOT_BACKLOG_ACTIVITY_USER_MAPPINGS ? '{}'
-  INTERVAL = process.env.HUBOT_BACKLOG_ACTIVITY_INTERVAL ? 30000
-  USE_SLACK = process.env.HUBOT_BACKLOG_ACTIVITY_USE_SLACK?
+  robot.router.post "/room/:room", (req, res) ->
+    room = req.params.room
+    body = req.body
 
-  statuses = []
-  resolutions = []
-  minId = null
+    console.log 'body type = ' + body.type
+    console.log 'room = ' + room
 
-  rpad = (s, l) ->
-    while s.length < l
-      s += '  ' # full width for japanese
-    s
+    try
+      switch body.type
+          when 1
+              label = '課題が追加'
+          when 2, 3
+              label = '課題が更新'
+          when 4
+              label = '課題が削除'
+          else
+              return
 
-  getStatus = (value) ->
-    status = statuses.filter((i) -> i.id is parseInt(value, 10))[0]
-    status?.name ? value
 
-  getResolution = (value) ->
-    resolution = resolutions.filter((r) -> r.id is parseInt(value, 10))[0]
-    resolution?.name ? value
+      url = "#{backlogUrl}view/#{body.project.projectKey}-#{body.content.key_id}"
 
-  formatActivity = (activity) ->
-    a = activity
-    c = a.content
-    userName = a.createdUser.name
-    issueKey = "#{a.project.projectKey}-#{a.content.key_id}"
-    url = "https://#{SPACE_ID}.backlog.jp/view/#{issueKey}"
-    if c.comment?
-      # switch status or add comment
-      maxWidth = 0
-      changes = c.changes.map (change) ->
-        switch
-          when change.field is 'status'
-            change.field = '状態'
-            change.old_value = getStatus change.old_value
-            change.new_value = getStatus change.new_value
-          when change.field is 'assigner' then change.field = '担当者'
-          when change.field is 'startDate' then change.field = '開始日'
-          when change.field is 'limitDate' then change.field = '期限日'
-          when change.field is 'milestone' then change.field = 'マイルストーン'
-          when change.field is 'resolution'
-            change.field = '完了理由'
-            change.old_value = getResolution change.old_value
-            change.new_value = getResolution change.new_value
-          when change.field is 'estimatedHours' then change.field = '予定時間'
-          when change.field is 'actualHours' then change.field = '実績時間'
-        maxWidth = change.field.length if change.field.length > maxWidth
-        change
-      .map (change) ->
-        field = rpad(change.field, maxWidth)
-        "  #{field} : #{change.old_value} -> #{change.new_value}"
-      .join '\n'
-      """
-        #{url} #{c.summary}
-        #{userName} #{a.content.comment?.content}
-        #{changes}
-      """
-    else
-      # create issue
-      """
-        #{url} #{c.summary}
-        #{userName} #{c.description}
-      """
+      if body.content.comment?.id?
+          url += "#comment-#{body.content.comment.id}"
 
-  getMention = (activity) ->
-    c = activity.content
-    assigner = c.changes?.filter((change) -> change.field is '担当者')[0]
-    return '' unless assigner?
-    mentionNames = JSON.parse USER_MAPPINGS
-    mentionName = mentionNames[assigner.new_value]
-    return '' unless mentionName?
-    mentionName
+      message = "[info][title]Backlogより[/title]"
+      message += "#{body.createdUser.name}さんによって#{label}されました\n"
+      message += "[#{body.project.projectKey}-#{body.content.key_id}]"
+      message += "#{body.content.summary}\n"
 
-  sendActivity = (robot, activity) ->
-    rooms = JSON.parse(MAPPINGS)
-    room = rooms[activity.project.projectKey]
-    return unless room?
-    return unless activity.type in [1, 2, 3]
-    message = formatActivity activity
-    wrapped = if USE_SLACK then '```\n' + message + '\n```' else message
-    mention = getMention activity
-    if mention?.length > 0
-      if USE_SLACK
-        reply_to = robot.brain.userForName(mention)?.reply_to
-        user = name: mention
-        robot.send { reply_to, user, room }, mention + ': ' + wrapped
+      if body.content.comment?.content?
+          message += "#{body.content.comment.content}\n"
+      message += "#{url}[/info]"
+
+      console.log 'message = ' + message
+
+      if message?
+          robot.messageRoom room, message
+          res.end "OK"
       else
-        user = robot.brain.userForName mention
-        robot.send { user, room }, wrapped
-    else
-      robot.messageRoom room, wrapped
-
-  get = (path, callback) ->
-    options =
-      url: "https://#{SPACE_ID}.backlog.jp#{path}"
-      method: 'GET'
-      qs:
-        apiKey: API_KEY
-    request options, (err, res) ->
-      return callback(err) if err?
-      callback null, JSON.parse(res.body)
-
-  fetchStatuses = (callback) ->
-    get '/api/v2/statuses', callback
-
-  fetchResolutions = (callback) ->
-    get '/api/v2/resolutions', callback
-
-  fetchActivity = (callback) ->
-    options =
-      url: "https://#{SPACE_ID}.backlog.jp/api/v2/space/activities"
-      method: 'GET'
-      qs: {}
-    options.qs.minId = minId if minId?
-    options.qs.apiKey = API_KEY
-    request options, (err, res) ->
-      return callback(err) if err?
-      activities = JSON.parse(res.body)
-      isFirst = !minId?
-      minId = activities[0].id if activities.length > 0
-      callback null, (if isFirst then [] else activities)
-
-  fetchAndSendActivity = ->
-    fetchActivity (err, activities) ->
-      if err?
-        robot.logger.error err
-      else
-        activities.forEach (activity) ->
-          sendActivity robot, activity
-      setTimeout fetchAndSendActivity, INTERVAL
-
-  fetchStatuses (err, r) -> statuses = r
-  fetchResolutions (err, r) -> resolutions = r
-  fetchAndSendActivity()
+          robot.messageRoom room, "Backlog integration error."
+          res.end "Error"
+    catch error
+      robot.send
+      res.end "Error"
